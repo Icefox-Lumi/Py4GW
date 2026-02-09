@@ -53,8 +53,11 @@ try:
         GLOBAL_CACHE,
         ModelID,
         Map,
+        ImGui,          # NEW: needed for persisted windows
+        SharedCommandType,
     )
     from Py4GWCoreLib import ItemArray, Bag, Item, Effects, Player
+    from Py4GWCoreLib.IniManager import IniManager  # NEW: persisted windows
 
     BOT_NAME = "Pycons"
     INI_SECTION = "Pycons"
@@ -73,6 +76,39 @@ try:
 
     # Scan only these bags, and only on-demand
     SCAN_BAGS = [Bag.Backpack, Bag.Belt_Pouch, Bag.Bag_1, Bag.Bag_2]
+
+    # -------------------------
+    # Window position persistence (minimal)
+    # -------------------------
+    _ini_ready = False
+    INI_KEY_MAIN = ""
+    INI_KEY_SETTINGS = ""
+    _INI_PATH = "Widgets/Pycons"
+    _INI_MAIN_FILE = "Pycons.MainWindow.ini"
+    _INI_SETTINGS_FILE = "Pycons.SettingsWindow.ini"
+
+    def _init_window_persistence_once() -> bool:
+        """Create/load separate ImGui ini files for main + settings windows (runs once)."""
+        global _ini_ready, INI_KEY_MAIN, INI_KEY_SETTINGS
+        if _ini_ready:
+            return True
+        if not Routines.Checks.Map.MapValid():
+            return False
+
+        ini = IniManager()
+
+        INI_KEY_MAIN = ini.ensure_key(_INI_PATH, _INI_MAIN_FILE)
+        if not INI_KEY_MAIN:
+            return False
+        ini.load_once(INI_KEY_MAIN)
+
+        INI_KEY_SETTINGS = ini.ensure_key(_INI_PATH, _INI_SETTINGS_FILE)
+        if not INI_KEY_SETTINGS:
+            return False
+        ini.load_once(INI_KEY_SETTINGS)
+
+        _ini_ready = True
+        return True
 
     # -------------------------
     # UI helpers (tuple/non-tuple returns)
@@ -363,6 +399,10 @@ try:
                 self.alcohol_selected[k] = ini_handler.read_bool(INI_SECTION, f"alcohol_selected_{k}", False)
                 self.alcohol_enabled_items[k] = ini_handler.read_bool(INI_SECTION, f"alcohol_enabled_{k}", False)
 
+            # Team / multibox settings
+            self.team_broadcast = ini_handler.read_bool(INI_SECTION, "team_broadcast", False)
+            self.team_consume_opt_in = ini_handler.read_bool(INI_SECTION, "team_consume_opt_in", False)
+
             self._dirty = False
             self._save_timer = Timer()
             self._save_timer.Start()
@@ -396,6 +436,13 @@ try:
                 ini_handler.write_key(INI_SECTION, f"alcohol_selected_{k}", str(bool(v)))
             for k, v in self.alcohol_enabled_items.items():
                 ini_handler.write_key(INI_SECTION, f"alcohol_enabled_{k}", str(bool(v)))
+
+            # Team / multibox settings
+            # Only the broadcaster (leader) needs to write team_broadcast
+            # Only the consumer (follower) needs to write team_consume_opt_in
+            # To avoid cross-overwrites, we only write team_broadcast here
+            ini_handler.write_key(INI_SECTION, "team_broadcast", str(bool(self.team_broadcast)))
+            _debug(f"Saved team_broadcast setting: {self.team_broadcast}", Console.MessageType.Debug)
 
             for k, v in self.selected.items():
                 ini_handler.write_key(INI_SECTION, f"selected_{k}", str(bool(v)))
@@ -752,6 +799,27 @@ try:
         _alcohol_level_base = int(min(5, cur + int(drunk_add)))
         _alcohol_last_drink_ms = int(now_ms)
 
+    # -------------------------
+    # Team broadcast helper
+    # -------------------------
+    def _broadcast_use(model_id: int, repeat: int = 1):
+        try:
+            if not bool(cfg.team_broadcast):
+                return
+            sender = Player.GetAccountEmail()
+            accounts = GLOBAL_CACHE.ShMem.GetAllAccountData() or []
+            for acc in accounts:
+                if not acc or not getattr(acc, "AccountEmail", None):
+                    continue
+                if acc.AccountEmail == sender:
+                    continue
+                try:
+                    GLOBAL_CACHE.ShMem.SendMessage(sender, acc.AccountEmail, SharedCommandType.UseItem, (float(model_id), float(repeat), 0.0, 0.0))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _pick_alcohol(cur_level: int, target_level: int, pool_keys: list):
         if not pool_keys:
             return None
@@ -855,6 +923,10 @@ try:
                 t.Start()
                 aftercast_timer.Start()
                 _last_used_ms[key] = _now_ms()
+                try:
+                    _broadcast_use(model_id, 1)
+                except Exception:
+                    pass
                 return True
 
         return False
@@ -919,6 +991,10 @@ try:
             _alcohol_apply_drink(int(pick.get("drunk_add", 1) or 1), now)
             t.Start()
             aftercast_timer.Start()
+            try:
+                _broadcast_use(model_id, 1)
+            except Exception:
+                pass
             return True
 
         return False
@@ -943,8 +1019,8 @@ try:
     # Main Window
     # -------------------------
     def _draw_main_window():
-        if not PyImGui.begin(BOT_NAME, PyImGui.WindowFlags.AlwaysAutoResize):
-            PyImGui.end()
+        if not ImGui.Begin(INI_KEY_MAIN, BOT_NAME, flags=PyImGui.WindowFlags.AlwaysAutoResize):
+            ImGui.End(INI_KEY_MAIN)
             return
 
         if PyImGui.button("Settings##pycons_settings"):
@@ -1127,7 +1203,7 @@ try:
                             cfg.alcohol_enabled_items[k] = bool(new_enabled)
                             cfg.mark_dirty()
 
-        PyImGui.end()
+        ImGui.End(INI_KEY_MAIN)
 
     # -------------------------
     # Settings Window
@@ -1220,14 +1296,40 @@ try:
         if not show_settings[0]:
             return
 
-        if not PyImGui.begin("Pycons - Settings##PyconsSettings", PyImGui.WindowFlags.AlwaysAutoResize):
-            PyImGui.end()
+        # Allow manual resizing of the Settings window by removing the
+        # AlwaysAutoResize flag. Users can now expand/collapse and resize
+        # the settings window to their preference.
+        if not ImGui.Begin(INI_KEY_SETTINGS, "Pycons - Settings##PyconsSettings"):
+            ImGui.End(INI_KEY_SETTINGS)
             return
 
         changed, v = ui_checkbox("Debug logging##pycons_debug", bool(cfg.debug_logging))
         if changed:
             cfg.debug_logging = bool(v)
             cfg.mark_dirty()
+
+        # Team settings
+        changed, v = ui_checkbox("Broadcast usage to team##pycons_team_broadcast", bool(cfg.team_broadcast))
+        if changed:
+            cfg.team_broadcast = bool(v)
+            cfg.mark_dirty()
+            # Immediately write broadcast setting (don't wait for throttle)
+            try:
+                ini_handler.write_key(INI_SECTION, "team_broadcast", str(bool(v)))
+                _log(f"Team broadcast setting changed to: {bool(v)}", Console.MessageType.Info)
+            except Exception as e:
+                _debug(f"Failed to write team_broadcast: {e}", Console.MessageType.Warning)
+
+        changed, v = ui_checkbox("Opt in to team broadcasts (consume when others broadcast)##pycons_team_optin", bool(cfg.team_consume_opt_in))
+        if changed:
+            cfg.team_consume_opt_in = bool(v)
+            cfg.mark_dirty()
+            # Immediately write opt-in setting (don't wait for throttle)
+            try:
+                ini_handler.write_key(INI_SECTION, "team_consume_opt_in", str(bool(v)))
+                _log(f"Team opt-in setting changed to: {bool(v)}", Console.MessageType.Info)
+            except Exception as e:
+                _debug(f"Failed to write team_consume_opt_in: {e}", Console.MessageType.Warning)
 
         changed, v = ui_checkbox("Advanced intervals##pycons_advint", bool(cfg.show_advanced_intervals))
         if changed:
@@ -1428,12 +1530,15 @@ try:
 
                 cfg.mark_dirty()
 
-        PyImGui.end()
+        ImGui.End(INI_KEY_SETTINGS)
 
     def configure():
         pass
 
     def main():
+        if not _init_window_persistence_once():  # NEW: ensure both window INIs are ready
+            return
+
         _draw_main_window()
         _draw_settings_window()
 

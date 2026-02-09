@@ -1263,6 +1263,7 @@ def Unlock_Eye_Of_The_North_Pool(bot: Botting):
     bot.Dialogs.WithModel(6021, 0x0000008A) # Gwen dialog to obtain Keiran's bow. Model id updated 20.12.2025 GW Reforged
     bot.Move.XYAndDialog(-6133.41, 5717.30, 0x838904) # Ogden dialog. Model id updated 20.12.2025 GW Reforged
     bot.Move.XYAndDialog(-5626.80, 6259.57, 0x839304) # Vekk dialog. Model id updated 20.12.2025 GW Reforged
+    bot.Map.Travel(target_map_id=642)
 
 def Attribute_Points_Quest_2(bot: Botting):
     def enable_combat_and_wait(ms:int):
@@ -1272,6 +1273,7 @@ def Attribute_Points_Quest_2(bot: Botting):
         bot.Properties.Disable("auto_combat")
  
     bot.States.AddHeader("Attribute points quest n. 2")
+    bot.Party.LeaveParty()
     bot.Map.Travel(target_map_name="Seitung Harbor")
     auto_path_list = [(16602.23, 11612.10), (16886.80, 9577.24), (16940.28, 9860.90), 
                       (19243.22, 9093.26), (19840.55, 7956.64)]
@@ -1279,9 +1281,12 @@ def Attribute_Points_Quest_2(bot: Botting):
     bot.Interact.WithGadgetAtXY(19642.00, 7386.00)
     bot.Wait.ForTime(5000)
     bot.Dialogs.WithModel(4009,0x815C01) #Zunraa model id updated 20.12.2025 GW Reforged
-    PrepareForBattle(bot)
+    bot.Party.LeaveParty()
+    bot.States.AddCustomState(StandardHeroTeam, name="Standard Hero Team")
+    bot.Party.AddHenchmanList([1, 5])
     bot.Dialogs.AtXY(20350.00, 9087.00, 0x80000B)
     bot.Wait.ForMapLoad(target_map_id=246)  #Zen Daijun
+    ConfigureAggressiveEnv(bot)
     auto_path_list:List[Tuple[float, float]] = [
     (-13959.50, 6375.26), #Half the temple
     (-14567.47, 1775.31), #Side of road
@@ -1707,6 +1712,7 @@ def Unlock_Olias(bot:Botting):
     bot.Wait.ForMapToChange(target_map_id=55)
     bot.Party.LeaveParty()
     bot.Map.Travel(target_map_id=449)
+    bot.Move.XY(-8149.02, 14900.65)
     bot.Move.XYAndDialog(-6480.00, 16331.00, 0x830E07)
     
 def Unlock_Xunlai_Material_Panel(bot: Botting) -> None:
