@@ -14,6 +14,8 @@ CONFIG_VERSION = 3
 DEFAULT_COOLDOWN_SECONDS = 0.5
 UNMAPPED_KEY_NAME = 'Unmapped'
 NO_MODIFIER_VALUE = 0
+CONFIG_BACKUP_LIMIT = 5
+CONFIG_BACKUP_DIR_SUFFIX = '_backups'
 SHAPE_EXPORT_TYPE = 'py4gw_party_formation_shape'
 SHAPE_EXPORT_VERSION = 1
 SHAPE_COORDINATE_SPACE = 'leader_relative_facing'
@@ -288,6 +290,26 @@ class FormationApplyResult:
 
 
 @dataclass
+class FormationConfigBackupInfo:
+    path: str
+    name: str
+    created_at: float = 0.0
+    size: int = 0
+
+
+@dataclass
+class FormationConfigBackupResult:
+    ok: bool = False
+    skipped: bool = False
+    message: str = ''
+    backup_path: str = ''
+    restored_path: str = ''
+    preserved_current_path: str = ''
+    removed: int = 0
+    details: list[str] = field(default_factory=list)
+
+
+@dataclass
 class FormationTargetDuplicate:
     target_key: tuple[str, object]
     target_label: str
@@ -401,6 +423,107 @@ def default_config_path() -> str:
     return os.path.join(base_path, 'Widgets', 'Config', 'party_formations.json')
 
 
+def config_backup_dir(path: str | None = None) -> str:
+    resolved_path = path or default_config_path()
+    directory = os.path.dirname(resolved_path) or os.getcwd()
+    stem, _extension = os.path.splitext(os.path.basename(resolved_path))
+    return os.path.join(directory, f'{stem}{CONFIG_BACKUP_DIR_SUFFIX}')
+
+
+def _config_backup_stem(path: str) -> str:
+    stem, _extension = os.path.splitext(os.path.basename(path))
+    return stem or 'party_formations'
+
+
+def _config_backup_filename(path: str) -> str:
+    timestamp = time.strftime('%Y%m%d-%H%M%S')
+    return f'{_config_backup_stem(path)}.{timestamp}.{time.time_ns()}.json'
+
+
+def _config_backup_sort_key(info: FormationConfigBackupInfo) -> tuple[float, str]:
+    return float(info.created_at or 0.0), info.name
+
+
+def list_config_backups(path: str | None = None) -> list[FormationConfigBackupInfo]:
+    resolved_path = path or default_config_path()
+    backup_dir = config_backup_dir(resolved_path)
+    if not os.path.isdir(backup_dir):
+        return []
+
+    stem = _config_backup_stem(resolved_path)
+    prefix = f'{stem}.'
+    backups: list[FormationConfigBackupInfo] = []
+    try:
+        names = os.listdir(backup_dir)
+    except OSError:
+        return []
+
+    for name in names:
+        if not name.startswith(prefix) or not name.endswith('.json'):
+            continue
+        backup_path = os.path.join(backup_dir, name)
+        if not os.path.isfile(backup_path):
+            continue
+        try:
+            stat = os.stat(backup_path)
+        except OSError:
+            continue
+        backups.append(
+            FormationConfigBackupInfo(
+                path=backup_path,
+                name=name,
+                created_at=float(stat.st_mtime),
+                size=int(stat.st_size),
+            )
+        )
+
+    return sorted(backups, key=_config_backup_sort_key, reverse=True)
+
+
+def _read_valid_config_text(path: str) -> tuple[str | None, str]:
+    if not os.path.exists(path):
+        return None, 'No existing config file to back up.'
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            text = handle.read()
+    except OSError as exc:
+        return None, f'Could not read existing config: {exc}'
+
+    try:
+        raw = json.loads(text)
+        json.dumps(raw, allow_nan=False)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        return None, f'Existing config is not valid JSON: {exc}'
+
+    if isinstance(raw, list):
+        formation_items = raw
+    elif isinstance(raw, dict):
+        formation_items = raw.get('formations', [])
+    else:
+        return None, 'Existing config has an unsupported top-level shape.'
+
+    if not isinstance(formation_items, list):
+        return None, 'Existing config formations value is not a list.'
+
+    for index, item in enumerate(formation_items):
+        if not isinstance(item, dict):
+            return None, f'Existing config formation {index + 1} is not an object.'
+        try:
+            PartyFormation.from_dict(item)
+        except (TypeError, ValueError, OverflowError) as exc:
+            return None, f'Existing config formation {index + 1} is not loadable: {exc}'
+
+    return text, ''
+
+
+def config_load_warning(path: str | None = None) -> str:
+    resolved_path = path or default_config_path()
+    _text, error = _read_valid_config_text(resolved_path)
+    if error == 'No existing config file to back up.':
+        return ''
+    return error
+
+
 def _write_text_atomic(path: str, text: str) -> None:
     directory = os.path.dirname(path)
     if directory:
@@ -423,6 +546,108 @@ def _write_text_atomic(path: str, text: str) -> None:
 def write_json_file_atomic(path: str, payload: Any, *, indent: int = 2, ensure_ascii: bool = True) -> None:
     text = json.dumps(payload, indent=indent, ensure_ascii=ensure_ascii, allow_nan=False)
     _write_text_atomic(path, text)
+
+
+def prune_config_backups(path: str | None = None, *, limit: int = CONFIG_BACKUP_LIMIT) -> int:
+    backups = list_config_backups(path)
+    keep_count = max(0, int(limit))
+    remove_count = 0
+    for backup in backups[keep_count:]:
+        try:
+            os.remove(backup.path)
+            remove_count += 1
+        except OSError:
+            pass
+    return remove_count
+
+
+def create_config_backup(
+    path: str | None = None,
+    *,
+    limit: int = CONFIG_BACKUP_LIMIT,
+) -> FormationConfigBackupResult:
+    resolved_path = path or default_config_path()
+    text, error = _read_valid_config_text(resolved_path)
+    if text is None:
+        return FormationConfigBackupResult(
+            skipped=True,
+            message=f'Config backup skipped: {error}',
+            details=[error],
+        )
+
+    backup_dir = config_backup_dir(resolved_path)
+    backup_path = os.path.join(backup_dir, _config_backup_filename(resolved_path))
+    try:
+        _write_text_atomic(backup_path, text)
+    except Exception as exc:
+        return FormationConfigBackupResult(
+            message=f'Config backup failed: {exc}',
+            details=[str(exc)],
+        )
+
+    removed = prune_config_backups(resolved_path, limit=limit)
+    return FormationConfigBackupResult(
+        ok=True,
+        message=f'Config backup created: {os.path.basename(backup_path)}',
+        backup_path=backup_path,
+        removed=removed,
+    )
+
+
+def restore_latest_config_backup(
+    path: str | None = None,
+    *,
+    limit: int = CONFIG_BACKUP_LIMIT,
+) -> FormationConfigBackupResult:
+    resolved_path = path or default_config_path()
+    backups = list_config_backups(resolved_path)
+    if not backups:
+        return FormationConfigBackupResult(message='No Party Formations config backups are available.')
+
+    latest = backups[0]
+    backup_text, backup_error = _read_valid_config_text(latest.path)
+    if backup_text is None:
+        return FormationConfigBackupResult(
+            message=f'Restore failed: latest backup is not loadable ({backup_error})',
+            details=[backup_error],
+        )
+
+    details: list[str] = []
+    preserve_result = create_config_backup(resolved_path, limit=limit + 1)
+    preserved_current_path = ''
+    if preserve_result.ok:
+        preserved_current_path = preserve_result.backup_path
+        details.append(f'Current config preserved as {os.path.basename(preserved_current_path)}.')
+    elif preserve_result.skipped:
+        details.append(preserve_result.message)
+    else:
+        return FormationConfigBackupResult(
+            message=preserve_result.message or 'Restore failed: could not preserve current config.',
+            details=preserve_result.details,
+        )
+
+    try:
+        _write_text_atomic(resolved_path, backup_text)
+    except Exception as exc:
+        return FormationConfigBackupResult(
+            message=f'Restore failed: {exc}',
+            restored_path=latest.path,
+            preserved_current_path=preserved_current_path,
+            details=details + [str(exc)],
+        )
+
+    removed = prune_config_backups(resolved_path, limit=limit)
+    details.append(f'Restored {latest.name}.')
+    if removed:
+        details.append(f'Removed {removed} old backup{"s" if removed != 1 else ""}.')
+    return FormationConfigBackupResult(
+        ok=True,
+        message=f'Restored Party Formations config from {latest.name}.',
+        restored_path=latest.path,
+        preserved_current_path=preserved_current_path,
+        removed=removed,
+        details=details,
+    )
 
 
 def load_formations(path: str | None = None) -> list[PartyFormation]:
@@ -454,13 +679,15 @@ def load_formations(path: str | None = None) -> list[PartyFormation]:
     return formations
 
 
-def save_formations(formations: list[PartyFormation], path: str | None = None) -> None:
+def save_formations(formations: list[PartyFormation], path: str | None = None) -> FormationConfigBackupResult:
     resolved_path = path or default_config_path()
+    backup_result = create_config_backup(resolved_path)
     payload = {
         'version': CONFIG_VERSION,
         'formations': [formation.to_dict() for formation in formations],
     }
     write_json_file_atomic(resolved_path, payload, indent=2)
+    return backup_result
 
 
 def make_default_formation_name(existing: list[PartyFormation]) -> str:

@@ -27,14 +27,18 @@ from HeroAI.party_formations import assignment_spot_label
 from HeroAI.party_formations import capture_assignment_offset
 from HeroAI.party_formations import clear_assignment_target
 from HeroAI.party_formations import clear_formation
+from HeroAI.party_formations import config_load_warning
 from HeroAI.party_formations import create_empty_formation
 from HeroAI.party_formations import default_spot_label
 from HeroAI.party_formations import export_formation_shape
 from HeroAI.party_formations import formation_has_assigned_targets
 from HeroAI.party_formations import get_available_members
 from HeroAI.party_formations import import_formation_shape
+from HeroAI.party_formations import list_config_backups
 from HeroAI.party_formations import load_formations
 from HeroAI.party_formations import preflight_apply_snapshot
+from HeroAI.party_formations import preflight_assignment_offset_warning
+from HeroAI.party_formations import restore_latest_config_backup
 from HeroAI.party_formations import save_formations
 from HeroAI.party_formations import write_json_file_atomic
 from Py4GWCoreLib.enums_src.GameData_enums import Range
@@ -57,6 +61,7 @@ last_status = 'Ready.'
 last_status_needs_attention = False
 status_lines: list[str] = []
 status_line_attention: list[bool] = []
+action_history: list[dict[str, object]] = []
 registered_hotkey_ids: set[str] = set()
 cooldowns = FormationCooldowns()
 loaded_once = False
@@ -113,7 +118,10 @@ canvas_snap_grid_index = 1
 apply_preview_row_mode_index = 0
 formation_name_edit_formation_id = ''
 formation_name_edit_text = ''
+formation_filter_text = ''
+formation_filter_pick_index = 0
 
+ACTION_HISTORY_LIMIT = 24
 CANVAS_HEIGHT = 360.0
 CANVAS_MIN_WIDTH = 260.0
 CANVAS_MIN_HEIGHT = 260.0
@@ -263,6 +271,34 @@ def _status_text_needs_attention(text: str) -> bool:
     return any(phrase in padded for phrase in attention_phrases)
 
 
+def _message_type_label(message_type) -> str:
+    if message_type is None:
+        return ''
+    return str(getattr(message_type, 'name', '') or message_type)
+
+
+def _record_action_history(
+    message: str,
+    details: list[str],
+    *,
+    needs_attention: bool,
+    message_type=None,
+) -> None:
+    if not message and not details:
+        return
+
+    action_history.append(
+        {
+            'time': time.strftime('%H:%M:%S'),
+            'message': str(message or ''),
+            'details': [str(detail) for detail in details[:10]],
+            'needs_attention': bool(needs_attention),
+            'message_type': _message_type_label(message_type),
+        }
+    )
+    del action_history[:-ACTION_HISTORY_LIMIT]
+
+
 def _set_status(message: str, details: list[str] | None = None, log: bool = True, message_type=None) -> None:
     global last_status, status_lines
     global last_status_needs_attention, status_line_attention
@@ -275,6 +311,12 @@ def _set_status(message: str, details: list[str] | None = None, log: bool = True
         message_type_attention or _status_text_needs_attention(detail)
         for detail in status_lines
     ]
+    _record_action_history(
+        message,
+        status_lines,
+        needs_attention=last_status_needs_attention or any(status_line_attention),
+        message_type=message_type,
+    )
     if log:
         _log(message, message_type=message_type)
         for detail in status_lines[:8]:
@@ -807,10 +849,19 @@ def _release_hotkey_latches() -> None:
             latched_hotkey_ids.discard(formation.formation_id)
 
 
-def _save() -> None:
+def _save():
     _reset_toggle_state()
-    save_formations(formations)
+    try:
+        backup_result = save_formations(formations)
+    except Exception as exc:
+        _set_status(
+            f'Save failed: {exc}',
+            log=True,
+            message_type=Py4GW.Console.MessageType.Warning,
+        )
+        raise
     _register_hotkeys()
+    return backup_result
 
 
 def _ensure_loaded() -> None:
@@ -822,6 +873,13 @@ def _ensure_loaded() -> None:
     selected_formation_index = min(selected_formation_index, max(0, len(formations) - 1))
     loaded_once = True
     _register_hotkeys()
+    warning = config_load_warning()
+    if warning and list_config_backups():
+        _set_status(
+            f'Config load warning: {warning}. Backups are available in Diagnostics.',
+            log=True,
+            message_type=Py4GW.Console.MessageType.Warning,
+        )
 
 
 def _refresh_members(force: bool = False) -> list[dict]:
@@ -862,6 +920,42 @@ def _selected_formation() -> PartyFormation | None:
     return formations[index]
 
 
+def _formation_filter_query() -> str:
+    return ' '.join(str(formation_filter_text or '').split()).casefold()
+
+
+def _formation_matches_filter(formation: PartyFormation, query: str) -> bool:
+    if not query:
+        return True
+
+    searchable_parts = [
+        str(getattr(formation, 'name', '') or ''),
+        _target_mode_label(formation),
+    ]
+    for index, assignment in enumerate(formation.assignments):
+        searchable_parts.append(assignment_spot_label(assignment, index))
+        searchable_parts.append(_canvas_target_display_label(formation, assignment))
+
+    searchable_text = ' '.join(part for part in searchable_parts if part).casefold()
+    return query in searchable_text
+
+
+def _filtered_formation_indexes(query: str) -> list[int]:
+    return [
+        index
+        for index, formation in enumerate(formations)
+        if _formation_matches_filter(formation, query)
+    ]
+
+
+def _formation_combo_label(index: int) -> str:
+    if index < 0 or index >= len(formations):
+        return 'Unknown Formation'
+    formation = formations[index]
+    name = str(formation.name or 'Unnamed Formation')
+    return f'{index + 1}. {name}' if _formation_filter_query() else name
+
+
 def _cancel_formation_name_edit() -> None:
     global formation_name_edit_formation_id
     global formation_name_edit_text
@@ -884,6 +978,24 @@ def _apply_formation_name_edit(formation: PartyFormation) -> None:
         formation.name = new_name
         _save()
     _cancel_formation_name_edit()
+
+
+def _select_formation_index(new_index: int) -> bool:
+    global selected_formation_index
+
+    if not formations:
+        return False
+    new_index = max(0, min(int(new_index), len(formations) - 1))
+    if new_index == selected_formation_index:
+        return True
+    if _block_if_canvas_position_draft_dirty('switching formations'):
+        return False
+
+    _finish_canvas_drag_if_needed()
+    _cancel_formation_name_edit()
+    selected_formation_index = new_index
+    _set_canvas_selection_group_to_primary(formations[selected_formation_index])
+    return True
 
 
 def _draw_formation_name_control(formation: PartyFormation) -> None:
@@ -2274,7 +2386,7 @@ def _draw_formation_canvas_spot(
 def _draw_canvas_spot_action_controls(formation: PartyFormation) -> None:
     if PyImGui.button('Add Unassigned Spot'):
         _add_unassigned_spot(formation)
-    ImGui.show_tooltip('Add a blank spot at the next default position.')
+    ImGui.show_tooltip('Add a blank spot with no target assigned yet.')
 
     PyImGui.same_line(0, 8)
     remove_selected_label = f'Remove Selected Spot##canvas_remove_selected_{formation.formation_id}'
@@ -2290,7 +2402,7 @@ def _draw_canvas_spot_action_controls(formation: PartyFormation) -> None:
         )
     else:
         remove_clicked = PyImGui.button(remove_selected_label)
-    ImGui.show_tooltip('Remove the primary selected spot only if it has no target.')
+    ImGui.show_tooltip('Requires confirmation. Only unassigned spots can be removed here.')
     if remove_clicked:
         _remove_selected_unassigned_spot(formation)
 
@@ -2497,12 +2609,12 @@ def _sync_canvas_editor_formation(formation: PartyFormation | None) -> None:
 def _draw_canvas_position_controls(formation: PartyFormation) -> None:
     if PyImGui.button('Save Positions'):
         _save_canvas_position_draft(formation)
-    ImGui.show_tooltip('Keep the spot positions you changed in the editor.')
+    ImGui.show_tooltip('Keep the spot positions you changed in the editor and write them to this formation.')
 
     PyImGui.same_line(0, 8)
     if PyImGui.button('Revert Positions'):
         _revert_canvas_position_draft(formation)
-    ImGui.show_tooltip('Undo unsaved spot position changes.')
+    ImGui.show_tooltip('Undo unsaved editor movement and return spots to their saved positions.')
 
     if _canvas_position_draft_dirty_for(formation):
         PyImGui.text_colored('Unsaved canvas position edits.', UI_COLOR_WARN)
@@ -2773,7 +2885,7 @@ def _draw_geometry_preset_controls(formation: PartyFormation) -> None:
     if delete_preset_clicked:
         _cancel_geometry_preset_rename()
         _delete_selected_geometry_preset(formation, presets)
-    ImGui.show_tooltip('Remove the chosen saved layout.')
+    ImGui.show_tooltip('Requires confirmation. Removes this saved layout from the preset library.')
 
     if canvas_preset_rename_active:
         PyImGui.spacing()
@@ -3417,26 +3529,173 @@ def _hotkey_conflict_details(formation: PartyFormation) -> list[str]:
     return [f'Hotkey also used by: {", ".join(conflicts)}']
 
 
-def _draw_formation_health_summary(formation: PartyFormation) -> None:
+def _formation_name_key(formation: PartyFormation) -> str:
+    name = ' '.join(str(getattr(formation, 'name', '') or 'Unnamed Formation').split())
+    return name.casefold() or 'unnamed formation'
+
+
+def _formation_name_counts() -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for formation in formations:
+        key = _formation_name_key(formation)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _duplicate_formation_name_details(
+    formation: PartyFormation,
+    name_counts: dict[str, int] | None = None,
+) -> list[str]:
+    counts = name_counts or _formation_name_counts()
+    duplicate_count = counts.get(_formation_name_key(formation), 0)
+    if duplicate_count <= 1:
+        return []
+    name = str(getattr(formation, 'name', '') or 'Unnamed Formation')
+    return [f'Duplicate formation name {name!r}: {duplicate_count} formations use this visible name.']
+
+
+def _duplicate_spot_label_details(formation: PartyFormation) -> list[str]:
+    labels: dict[str, dict[str, object]] = {}
+    for index, assignment in enumerate(formation.assignments):
+        label = assignment_spot_label(assignment, index)
+        key = ' '.join(label.split()).casefold()
+        entry = labels.setdefault(key, {'label': label, 'spots': []})
+        entry['spots'].append(str(index + 1))
+
+    details: list[str] = []
+    for entry in labels.values():
+        spots = entry['spots']
+        if isinstance(spots, list) and len(spots) > 1:
+            details.append(f'Duplicate spot label {entry["label"]!r}: spots {", ".join(spots)}')
+    return details
+
+
+def _offset_warning_details(formation: PartyFormation) -> list[str]:
+    details: list[str] = []
+    for index, assignment in enumerate(formation.assignments):
+        warning = preflight_assignment_offset_warning(assignment)
+        if warning:
+            details.append(f'Offset {assignment_spot_label(assignment, index)}: {warning}')
+    return details
+
+
+def _formation_issue_groups(
+    formation: PartyFormation,
+    lookup: dict[str, set],
+    name_counts: dict[str, int] | None = None,
+) -> dict[str, list[str]]:
+    return {
+        'name': _duplicate_formation_name_details(formation, name_counts),
+        'spot': _duplicate_spot_label_details(formation),
+        'target': _duplicate_target_details(formation),
+        'missing': _missing_target_details(formation, lookup),
+        'hotkey': _hotkey_conflict_details(formation),
+        'offset': _offset_warning_details(formation),
+    }
+
+
+def _formation_issue_details(issue_groups: dict[str, list[str]]) -> list[str]:
+    details: list[str] = []
+    for group_details in issue_groups.values():
+        details.extend(group_details)
+    return details
+
+
+def _formation_issue_summary(issue_groups: dict[str, list[str]]) -> str:
+    labels = {
+        'name': 'name',
+        'spot': 'spot',
+        'target': 'target',
+        'missing': 'missing',
+        'hotkey': 'hotkey',
+        'offset': 'offset',
+    }
+    parts = [
+        f'{labels.get(group_key, group_key)} {len(group_details)}'
+        for group_key, group_details in issue_groups.items()
+        if group_details
+    ]
+    return ', '.join(parts) if parts else 'none'
+
+
+def _formation_spot_counts(formation: PartyFormation) -> tuple[int, int, int]:
     enabled_count = sum(1 for assignment in formation.assignments if bool(getattr(assignment, 'enabled', True)))
     assigned_count = sum(1 for assignment in formation.assignments if assignment_has_target(assignment))
     unassigned_count = max(0, len(formation.assignments) - assigned_count)
+    return enabled_count, assigned_count, unassigned_count
+
+
+def _diagnostic_offset_tuple(assignment) -> tuple[float, float] | None:
+    if isinstance(getattr(assignment, 'offset_x', None), bool) or isinstance(
+        getattr(assignment, 'offset_y', None),
+        bool,
+    ):
+        return None
+    try:
+        offset_x = float(assignment.offset_x)
+        offset_y = float(assignment.offset_y)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(offset_x) or not math.isfinite(offset_y):
+        return None
+    return offset_x, offset_y
+
+
+def _formation_footprint(formation: PartyFormation) -> tuple[str, list[str]]:
+    points: list[tuple[float, float, str]] = []
+    skipped_disabled = 0
+    skipped_invalid = 0
+
+    for index, assignment in enumerate(formation.assignments):
+        if not bool(getattr(assignment, 'enabled', True)):
+            skipped_disabled += 1
+            continue
+        offset = _diagnostic_offset_tuple(assignment)
+        if offset is None:
+            skipped_invalid += 1
+            continue
+        points.append((offset[0], offset[1], assignment_spot_label(assignment, index)))
+
+    if not points:
+        details = ['No enabled spots with valid offsets.']
+        if skipped_disabled:
+            details.append(f'Skipped {skipped_disabled} disabled spot{"s" if skipped_disabled != 1 else ""}.')
+        if skipped_invalid:
+            details.append(f'Skipped {skipped_invalid} invalid offset{"s" if skipped_invalid != 1 else ""}.')
+        return 'no enabled spots', details
+
+    min_x = min(point[0] for point in points)
+    max_x = max(point[0] for point in points)
+    min_y = min(point[1] for point in points)
+    max_y = max(point[1] for point in points)
+    width = max_x - min_x
+    height = max_y - min_y
+    farthest_x, farthest_y, farthest_label = max(points, key=lambda point: math.hypot(point[0], point[1]))
+    farthest_radius = math.hypot(farthest_x, farthest_y)
+
+    spot_word = 'spot' if len(points) == 1 else 'spots'
+    summary = f'{len(points)} {spot_word}, radius {farthest_radius:.0f}, {width:.0f} x {height:.0f}'
+    details = [
+        f'Enabled valid spots: {len(points)}',
+        f'Farthest spot: {farthest_label} at {farthest_radius:.0f}',
+        f'Approx width: {width:.0f}',
+        f'Approx height: {height:.0f}',
+    ]
+    if skipped_disabled:
+        details.append(f'Skipped {skipped_disabled} disabled spot{"s" if skipped_disabled != 1 else ""}.')
+    if skipped_invalid:
+        details.append(f'Skipped {skipped_invalid} invalid offset{"s" if skipped_invalid != 1 else ""}.')
+    return summary, details
+
+
+def _draw_formation_health_summary(formation: PartyFormation) -> None:
+    enabled_count, assigned_count, unassigned_count = _formation_spot_counts(formation)
 
     members = _refresh_members()
     lookup = _member_lookup(members)
-    duplicate_details = _duplicate_target_details(formation)
-    missing_details = _missing_target_details(formation, lookup)
-    hotkey_details = _hotkey_conflict_details(formation)
-
-    issue_parts = []
-    if duplicate_details:
-        issue_parts.append(f'dup {len(duplicate_details)}')
-    if missing_details:
-        issue_parts.append(f'missing {len(missing_details)}')
-    if hotkey_details:
-        issue_parts.append(f'hotkey {len(hotkey_details)}')
-
-    issue_details = duplicate_details + missing_details + hotkey_details
+    issue_groups = _formation_issue_groups(formation, lookup)
+    issue_details = _formation_issue_details(issue_groups)
+    footprint_summary, footprint_details = _formation_footprint(formation)
 
     _draw_helper_text('Health:')
     ImGui.show_tooltip('Read-only formation summary.')
@@ -3447,12 +3706,411 @@ def _draw_formation_health_summary(formation: PartyFormation) -> None:
     PyImGui.same_line(0, 8)
     _draw_inline_count('Unassigned', unassigned_count, UI_COLOR_MUTED)
 
-    issue_color = UI_COLOR_GOOD if not issue_parts else UI_COLOR_WARN
-    PyImGui.text_colored('Issues: ' + ('none' if not issue_parts else ', '.join(issue_parts)), issue_color)
+    issue_color = UI_COLOR_GOOD if not issue_details else UI_COLOR_WARN
+    PyImGui.text_colored('Issues: ' + _formation_issue_summary(issue_groups), issue_color)
     if issue_details:
         ImGui.show_tooltip('\n'.join(issue_details[:12]))
     else:
-        ImGui.show_tooltip('No duplicate targets, missing targets, or hotkey conflicts detected.')
+        ImGui.show_tooltip(
+            'No duplicate names, duplicate spots, duplicate targets, missing targets, '
+            'hotkey conflicts, or offset warnings detected.'
+        )
+
+    _draw_helper_text(f'Footprint: {footprint_summary}')
+    ImGui.show_tooltip('\n'.join(footprint_details[:8]))
+
+
+def _all_formations_diagnostic_rows(lookup: dict[str, set], name_counts: dict[str, int]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for index, formation in enumerate(formations):
+        issue_groups = _formation_issue_groups(formation, lookup, name_counts)
+        issue_details = _formation_issue_details(issue_groups)
+        enabled_count, assigned_count, unassigned_count = _formation_spot_counts(formation)
+        footprint_summary, footprint_details = _formation_footprint(formation)
+        rows.append(
+            {
+                'index': index,
+                'formation': formation,
+                'issue_groups': issue_groups,
+                'issue_details': issue_details,
+                'enabled_count': enabled_count,
+                'assigned_count': assigned_count,
+                'unassigned_count': unassigned_count,
+                'footprint_summary': footprint_summary,
+                'footprint_details': footprint_details,
+            }
+        )
+    return rows
+
+
+def _draw_all_formations_diagnostics(selected_formation: PartyFormation) -> None:
+    if not PyImGui.collapsing_header('All Formations##PartyFormationAllDiagnosticsSection'):
+        return
+
+    members = _refresh_members()
+    lookup = _member_lookup(members)
+    rows = _all_formations_diagnostic_rows(lookup, _formation_name_counts())
+    issue_rows = sum(1 for row in rows if row['issue_details'])
+    issue_color = UI_COLOR_GOOD if issue_rows == 0 else UI_COLOR_WARN
+
+    _draw_helper_text('Read-only warning summary across saved formations.')
+    PyImGui.same_line(0, 8)
+    _draw_inline_count('Total', len(rows), UI_COLOR_INFO)
+    PyImGui.same_line(0, 8)
+    PyImGui.text_colored(f'Need review: {issue_rows}', issue_color)
+    ImGui.show_tooltip('Warnings here do not block saving, applying, editing, importing, or hotkeys.')
+
+    if not rows:
+        _draw_helper_text('No formations to inspect.')
+        return
+
+    table_flags = (
+        PyImGui.TableFlags.Borders
+        | PyImGui.TableFlags.RowBg
+        | PyImGui.TableFlags.SizingFixedFit
+        | PyImGui.TableFlags.Resizable
+        | PyImGui.TableFlags.ScrollX
+    )
+    if not PyImGui.begin_table('PartyFormationAllDiagnostics', 5, table_flags, 0, 0):
+        return
+
+    PyImGui.table_setup_column('Formation', PyImGui.TableColumnFlags.WidthFixed, 170)
+    PyImGui.table_setup_column('Mode', PyImGui.TableColumnFlags.WidthFixed, 80)
+    PyImGui.table_setup_column('Spots', PyImGui.TableColumnFlags.WidthFixed, 135)
+    PyImGui.table_setup_column('Issues', PyImGui.TableColumnFlags.WidthFixed, 160)
+    PyImGui.table_setup_column('Footprint', PyImGui.TableColumnFlags.WidthFixed, 190)
+    PyImGui.table_headers_row()
+
+    for row in rows:
+        formation = row['formation']
+        if not isinstance(formation, PartyFormation):
+            continue
+        issue_groups = row['issue_groups']
+        issue_details = row['issue_details']
+        footprint_details = row['footprint_details']
+        issue_summary = _formation_issue_summary(issue_groups) if isinstance(issue_groups, dict) else 'none'
+        current_marker = '> ' if formation.formation_id == selected_formation.formation_id else ''
+        enabled_count = int(row['enabled_count'])
+        assigned_count = int(row['assigned_count'])
+        unassigned_count = int(row['unassigned_count'])
+
+        PyImGui.table_next_row()
+        PyImGui.table_next_column()
+        PyImGui.text_wrapped(f'{current_marker}{formation.name or "Unnamed Formation"}')
+        ImGui.show_tooltip('> marks the currently selected formation.' if current_marker else 'Saved formation.')
+
+        PyImGui.table_next_column()
+        _draw_helper_text(_target_mode_label(formation))
+
+        PyImGui.table_next_column()
+        _draw_helper_text(f'{enabled_count} on / {assigned_count} assigned / {unassigned_count} open')
+
+        PyImGui.table_next_column()
+        color = UI_COLOR_GOOD if not issue_details else UI_COLOR_WARN
+        PyImGui.text_colored(issue_summary, color)
+        if issue_details:
+            ImGui.show_tooltip('\n'.join(str(detail) for detail in issue_details[:12]))
+        else:
+            ImGui.show_tooltip('No warning-only diagnostics for this formation.')
+
+        PyImGui.table_next_column()
+        _draw_helper_text(str(row['footprint_summary']))
+        if isinstance(footprint_details, list):
+            ImGui.show_tooltip('\n'.join(str(detail) for detail in footprint_details[:8]))
+
+    PyImGui.end_table()
+
+
+def _format_history_entry(entry: dict[str, object]) -> str:
+    timestamp = str(entry.get('time') or '--:--:--')
+    message = str(entry.get('message') or '')
+    prefix = '!' if bool(entry.get('needs_attention')) else '-'
+    message_type = str(entry.get('message_type') or '')
+    if message_type:
+        return f'{prefix} [{timestamp}] {message_type}: {message}'
+    return f'{prefix} [{timestamp}] {message}'
+
+
+def _apply_preview_diagnostic_lines(formation: PartyFormation) -> list[str]:
+    lines: list[str] = []
+    try:
+        snapshot = preflight_apply_snapshot(formation)
+    except Exception as exc:
+        return [f'Apply Preview unavailable: {exc}']
+
+    counts = snapshot.counts
+    lines.append(
+        f'Apply Preview: would target {snapshot.would_target}, skipped {snapshot.skipped}, '
+        f'warnings {snapshot.warnings}, runtime checked {snapshot.runtime_checked}, ready {snapshot.runtime_ready}'
+    )
+    lines.append(
+        f'Apply Counts: enabled {counts.enabled}, disabled {counts.disabled}, assigned {counts.assigned}, '
+        f'unassigned {counts.unassigned}, duplicate targets {counts.duplicate_targets}, '
+        f'offset warnings {counts.offset_warnings}'
+    )
+    for note in snapshot.warning_notes[:8]:
+        lines.append(f'Apply Warning: {note}')
+    for item in snapshot.items[:12]:
+        detail = _preflight_detail_text(item)
+        lines.append(f'Apply Row: {item.spot_label} | {item.status} | {detail}')
+    if len(snapshot.items) > 12:
+        lines.append(f'Apply Row: ... {len(snapshot.items) - 12} more')
+    return lines
+
+
+def _selected_formation_diagnostic_lines(formation: PartyFormation, lookup: dict[str, set]) -> list[str]:
+    enabled_count, assigned_count, unassigned_count = _formation_spot_counts(formation)
+    footprint_summary, footprint_details = _formation_footprint(formation)
+    issue_groups = _formation_issue_groups(formation, lookup, _formation_name_counts())
+    issue_details = _formation_issue_details(issue_groups)
+
+    lines = [
+        f'Selected Formation: {formation.name or "Unnamed Formation"}',
+        f'Formation ID: {formation.formation_id}',
+        f'Target Mode: {_target_mode_label(formation)}',
+        f'Spots: {enabled_count} enabled, {assigned_count} assigned, {unassigned_count} unassigned',
+        f'Issues: {_formation_issue_summary(issue_groups)}',
+        f'Footprint: {footprint_summary}',
+    ]
+    for detail in issue_details[:12]:
+        lines.append(f'Issue Detail: {detail}')
+    for detail in footprint_details[:8]:
+        lines.append(f'Footprint Detail: {detail}')
+    return lines
+
+
+def _all_formations_diagnostic_lines(lookup: dict[str, set]) -> list[str]:
+    rows = _all_formations_diagnostic_rows(lookup, _formation_name_counts())
+    issue_rows = sum(1 for row in rows if row['issue_details'])
+    lines = [f'All Formations: {len(rows)} total, {issue_rows} need review']
+    for row in rows[:24]:
+        formation = row['formation']
+        if not isinstance(formation, PartyFormation):
+            continue
+        issue_groups = row['issue_groups']
+        issue_summary = _formation_issue_summary(issue_groups) if isinstance(issue_groups, dict) else 'none'
+        lines.append(
+            f'- {formation.name or "Unnamed Formation"} | {_target_mode_label(formation)} | '
+            f'{row["enabled_count"]} on / {row["assigned_count"]} assigned / '
+            f'{row["unassigned_count"]} open | issues {issue_summary} | {row["footprint_summary"]}'
+        )
+    if len(rows) > 24:
+        lines.append(f'- ... {len(rows) - 24} more formations')
+    return lines
+
+
+def _action_history_diagnostic_lines() -> list[str]:
+    if not action_history:
+        return ['Recent Actions: none recorded']
+
+    lines = ['Recent Actions:']
+    for entry in action_history[-ACTION_HISTORY_LIMIT:]:
+        lines.append(_format_history_entry(entry))
+        details = entry.get('details')
+        if isinstance(details, list):
+            for detail in details[:5]:
+                lines.append(f'    {detail}')
+    return lines
+
+
+def _build_diagnostics_text(formation: PartyFormation) -> str:
+    members = _refresh_members()
+    lookup = _member_lookup(members)
+
+    lines = [
+        f'{MODULE_NAME} Diagnostics',
+        f'Generated: {time.strftime("%Y-%m-%d %H:%M:%S")}',
+        '',
+        'Current Status:',
+        str(last_status or ''),
+    ]
+    for detail in status_lines[:10]:
+        lines.append(f'  {detail}')
+
+    lines.extend(['', 'Selected Formation:'])
+    lines.extend(_selected_formation_diagnostic_lines(formation, lookup))
+    lines.extend(['', 'Apply Preview:'])
+    lines.extend(_apply_preview_diagnostic_lines(formation))
+    lines.extend(['', 'All Formations:'])
+    lines.extend(_all_formations_diagnostic_lines(lookup))
+    lines.extend(['', 'Action History:'])
+    lines.extend(_action_history_diagnostic_lines())
+    return '\n'.join(lines)
+
+
+def _copy_diagnostics_to_clipboard(formation: PartyFormation) -> None:
+    try:
+        diagnostics_text = _build_diagnostics_text(formation)
+        PyImGui.set_clipboard_text(diagnostics_text)
+    except Exception as exc:
+        _set_status(
+            f'Copy diagnostics failed: {exc}',
+            log=False,
+            message_type=Py4GW.Console.MessageType.Warning,
+        )
+        return
+
+    _set_status(
+        f'Copied diagnostics for {formation.name}.',
+        details=[f'Recent actions included: {len(action_history)}'],
+        log=False,
+        message_type=Py4GW.Console.MessageType.Info,
+    )
+
+
+def _draw_action_history() -> None:
+    if not PyImGui.collapsing_header('Recent Actions##PartyFormationActionHistorySection'):
+        return
+
+    PyImGui.same_line(0, 8)
+    if PyImGui.button('Clear History##party_formation_clear_action_history'):
+        _set_status('Cleared Party Formations action history.', log=False)
+        action_history.clear()
+        return
+    ImGui.show_tooltip('Clear only this in-memory diagnostics history.')
+
+    if not action_history:
+        _draw_helper_text('No recent actions recorded yet.')
+        return
+
+    table_flags = (
+        PyImGui.TableFlags.Borders
+        | PyImGui.TableFlags.RowBg
+        | PyImGui.TableFlags.SizingFixedFit
+        | PyImGui.TableFlags.Resizable
+        | PyImGui.TableFlags.ScrollY
+    )
+    if not PyImGui.begin_table('PartyFormationActionHistory', 3, table_flags, 0, 180):
+        return
+
+    PyImGui.table_setup_column('Time', PyImGui.TableColumnFlags.WidthFixed, 70)
+    PyImGui.table_setup_column('Status', PyImGui.TableColumnFlags.WidthFixed, 230)
+    PyImGui.table_setup_column('Details', PyImGui.TableColumnFlags.WidthFixed, 340)
+    PyImGui.table_headers_row()
+
+    for entry in reversed(action_history):
+        details = entry.get('details')
+        detail_text = ''
+        if isinstance(details, list):
+            detail_text = '\n'.join(str(detail) for detail in details[:5])
+        color = UI_COLOR_WARN if bool(entry.get('needs_attention')) else UI_COLOR_HELPER
+
+        PyImGui.table_next_row()
+        PyImGui.table_next_column()
+        _draw_helper_text(str(entry.get('time') or ''))
+        PyImGui.table_next_column()
+        PyImGui.text_colored(str(entry.get('message') or ''), color)
+        PyImGui.table_next_column()
+        if detail_text:
+            PyImGui.text_wrapped(detail_text)
+        else:
+            _draw_helper_text('-')
+
+    PyImGui.end_table()
+
+
+def _backup_time_label(created_at: float) -> str:
+    if created_at <= 0.0:
+        return 'unknown time'
+    try:
+        return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(created_at))
+    except Exception:
+        return 'unknown time'
+
+
+def _restore_latest_config_backup_from_ui() -> None:
+    global formations
+    global selected_formation_index
+    global formation_filter_pick_index
+
+    if _block_if_canvas_position_draft_dirty('restoring config backups'):
+        return
+
+    _finish_canvas_drag_if_needed()
+    result = restore_latest_config_backup()
+    if not result.ok:
+        _set_status(
+            result.message or 'Restore backup failed.',
+            details=result.details,
+            log=True,
+            message_type=Py4GW.Console.MessageType.Warning,
+        )
+        return
+
+    formations = load_formations()
+    selected_formation_index = min(selected_formation_index, max(0, len(formations) - 1))
+    formation_filter_pick_index = 0
+    _cancel_formation_name_edit()
+    _clear_canvas_position_draft()
+    _reset_toggle_state()
+    if formations:
+        _set_canvas_selection_group_to_primary(formations[selected_formation_index])
+    else:
+        canvas_selected_assignment_indexes.clear()
+    _register_hotkeys()
+    _set_status(
+        result.message,
+        details=result.details,
+        log=True,
+        message_type=Py4GW.Console.MessageType.Info,
+    )
+
+
+def _draw_config_backups() -> None:
+    backups = list_config_backups()
+    newest = backups[0] if backups else None
+    newest_label = _backup_time_label(float(newest.created_at)) if newest is not None else 'none'
+    summary_color = UI_COLOR_INFO if backups else UI_COLOR_HELPER
+    PyImGui.text_colored(f'Config backups: {len(backups)} available, newest: {newest_label}', summary_color)
+    ImGui.show_tooltip(
+        'Backups are kept outside the main config and restored only when you choose Restore Latest Backup.'
+    )
+
+    warning = config_load_warning()
+    if warning and backups:
+        PyImGui.text_colored('Config load warning: backups are available.', UI_COLOR_WARN)
+        ImGui.show_tooltip(warning)
+
+    if not PyImGui.collapsing_header('Config Backups##PartyFormationConfigBackupsSection'):
+        return
+
+    if not backups:
+        _draw_helper_text('No backups have been created yet. Backups are created before overwriting a valid config.')
+        if warning:
+            PyImGui.text_colored(f'Config warning: {warning}', UI_COLOR_WARN)
+        return
+
+    _draw_helper_text('Backups are created before valid configs are overwritten. The newest 5 are kept.')
+    latest = backups[0]
+    restore_clicked = _draw_confirm_destructive_button(
+        'Restore Latest Backup##party_formation_restore_latest_backup',
+        confirmation_key=f'restore_latest_config:{latest.name}:{int(latest.created_at)}',
+        width=138,
+        height=0,
+        armed_width=178,
+    )
+    ImGui.show_tooltip('Restore the newest backup. The current valid config is backed up first when possible.')
+    if restore_clicked:
+        _restore_latest_config_backup_from_ui()
+        return
+
+    _draw_helper_text('Latest backups:')
+    for backup in backups[:5]:
+        _draw_helper_text(f'{_backup_time_label(float(backup.created_at))} - {backup.name}')
+        ImGui.show_tooltip('A saved copy of an older Party Formations config.')
+
+
+def _draw_diagnostics_tools(formation: PartyFormation) -> None:
+    if PyImGui.button('Copy Diagnostics##party_formation_copy_diagnostics'):
+        _copy_diagnostics_to_clipboard(formation)
+    ImGui.show_tooltip(
+        'Copy selected formation diagnostics, Apply Preview, all-formation warnings, and recent actions.'
+    )
+    PyImGui.same_line(0, 8)
+    _draw_helper_text(f'Recent actions: {len(action_history)}')
+    ImGui.show_tooltip('Recent UI outcomes kept in memory for testing and diagnostics.')
+    _draw_config_backups()
+    _draw_action_history()
 
 
 def _preflight_detail_text(item) -> str:
@@ -3504,6 +4162,7 @@ def _draw_apply_preflight_snapshot(formation: PartyFormation) -> None:
         f'{counts.enabled} enabled / {counts.disabled} off / {counts.unassigned} unassigned / '
         f'dup {counts.duplicate_targets} / offset {counts.offset_warnings}'
     )
+    ImGui.show_tooltip('Preview counts only. This does not move heroes or change active flags.')
 
     apply_preview_row_mode_index = max(0, min(apply_preview_row_mode_index, len(APPLY_PREVIEW_ROW_MODE_LABELS) - 1))
     PyImGui.set_next_item_width(140)
@@ -3517,6 +4176,7 @@ def _draw_apply_preflight_snapshot(formation: PartyFormation) -> None:
 
     display_items = _preflight_display_items(snapshot, apply_preview_row_mode_index)
     _draw_helper_text(f'Rows shown: {len(display_items)} of {len(snapshot.items)}')
+    ImGui.show_tooltip('Rows describe what Apply would try from the current live party state.')
     if not display_items:
         _draw_helper_text('No enabled assigned targets to preview.')
         return
@@ -3542,6 +4202,7 @@ def _draw_apply_preflight_snapshot(formation: PartyFormation) -> None:
         PyImGui.table_next_column()
         status = str(getattr(item, 'status', '') or '')
         PyImGui.text_colored(status, _preflight_status_color(status))
+        ImGui.show_tooltip('Would target means Apply can currently send this spot. Other statuses need review.')
         PyImGui.table_next_column()
         PyImGui.text_wrapped(_preflight_detail_text(item))
 
@@ -3635,6 +4296,20 @@ def _mapping_row_status(row: dict) -> str:
     return 'Available'
 
 
+def _mapping_status_tooltip(status: str) -> str:
+    if status == 'Assigned':
+        return 'This current party member is used by one formation spot.'
+    if status == 'Duplicate':
+        return 'More than one formation spot resolves to this same current party member.'
+    if status == 'Unavailable':
+        return 'The saved target was not found in the current party.'
+    if status == 'Empty':
+        return 'The saved party slot is currently empty.'
+    if status == 'Available':
+        return 'This current party member is available but not assigned in this formation.'
+    return 'Current-party lookup status for this saved target.'
+
+
 def _mapping_summary_counts(rows: list[dict]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for row in rows:
@@ -3718,6 +4393,7 @@ def _draw_current_party_mapping_summary(rows: list[dict]) -> None:
 
     counts = _mapping_summary_counts(rows)
     _draw_helper_text('Mapping:')
+    ImGui.show_tooltip('Live lookup of this formation against the current party.')
     wrote_segment = False
     wrote_segment = _draw_mapping_summary_segment(
         'Assigned',
@@ -3770,13 +4446,17 @@ def _draw_current_party_mapping(formation: PartyFormation, rows: list[dict] | No
         PyImGui.table_next_row()
         PyImGui.table_next_column()
         PyImGui.text_wrapped(str(row.get('target') or 'Unknown'))
+        ImGui.show_tooltip('Saved party slot or identity key being checked.')
         PyImGui.table_next_column()
         PyImGui.text_wrapped(str(row.get('member') or '-'))
+        ImGui.show_tooltip('Current party member matched to that saved target, if any.')
         PyImGui.table_next_column()
         PyImGui.text_wrapped(', '.join(spots) if spots else 'None')
+        ImGui.show_tooltip('Formation spots that resolve to this target.')
         PyImGui.table_next_column()
         status = _mapping_row_status(row)
         PyImGui.text_colored(status, _mapping_status_color(status))
+        ImGui.show_tooltip(_mapping_status_tooltip(status))
 
     PyImGui.end_table()
 
@@ -3902,13 +4582,16 @@ def _draw_assignment_table(formation: PartyFormation) -> None:
             spot_label = assignment_spot_label(assignment, index)
             PyImGui.set_next_item_width(120)
             new_spot_label = PyImGui.input_text(f'##spot_label_{formation.formation_id}_{index}', spot_label)
+            ImGui.show_tooltip('Short label shown in the canvas, diagnostics, and imported/exported shapes.')
             if new_spot_label.strip() != spot_label:
                 assignment.spot_label = new_spot_label.strip()
                 _save()
 
             PyImGui.table_next_column()
             PyImGui.text_wrapped(_assignment_display_label(formation, assignment))
+            ImGui.show_tooltip('The saved target for this spot. Assign/Replace changes it.')
             PyImGui.text_colored(_assignment_kind_label(formation, assignment), _assignment_kind_color(formation, assignment))
+            ImGui.show_tooltip('How this spot is resolved when Apply runs.')
 
             PyImGui.table_next_column()
             if draft_dirty:
@@ -3979,7 +4662,7 @@ def _draw_assignment_table(formation: PartyFormation) -> None:
                     height=0,
                     armed_width=70,
                 )
-            ImGui.show_tooltip('Remove this assignment row from the formation.')
+            ImGui.show_tooltip('Requires confirmation. Removes this row, including its target and geometry.')
             if remove_clicked:
                 if not _block_if_canvas_position_draft_dirty('removing assignments', formation):
                     remove_index = index
@@ -3993,22 +4676,98 @@ def _draw_assignment_table(formation: PartyFormation) -> None:
         _set_status(f'Removed {removed.display_name()} from {formation.name}.', log=False)
 
 
+def _draw_formation_filter_controls() -> tuple[bool, list[int]]:
+    global formation_filter_text
+
+    PyImGui.set_next_item_width(220)
+    new_filter_text = PyImGui.input_text('Filter##party_formation_filter', formation_filter_text)
+    if new_filter_text != formation_filter_text:
+        formation_filter_text = new_filter_text
+
+    query = _formation_filter_query()
+    filtered_indexes = _filtered_formation_indexes(query)
+    filter_active = bool(query)
+    ImGui.show_tooltip(
+        'Filter formations by name, target mode, spot label, or target label. Filtering does not edit them.'
+    )
+
+    if filter_active:
+        PyImGui.same_line(0, 8)
+        if PyImGui.button('Clear Filter##party_formation_filter_clear'):
+            formation_filter_text = ''
+            query = ''
+            filtered_indexes = _filtered_formation_indexes(query)
+            filter_active = False
+        ImGui.show_tooltip('Show every formation again.')
+
+    if filter_active:
+        _draw_helper_text(f'Filter: showing {len(filtered_indexes)} of {len(formations)} formations.')
+    else:
+        _draw_helper_text(f'Filter: off ({len(formations)} formations).')
+
+    return filter_active, filtered_indexes
+
+
 def _draw_formation_controls() -> PartyFormation | None:
     global selected_formation_index
+    global formation_filter_pick_index
 
     _draw_section_header('Formation')
-    names = [formation.name for formation in formations]
     selected_formation_index = max(0, min(selected_formation_index, len(formations) - 1))
-    new_selected_formation_index = PyImGui.combo('Formation', selected_formation_index, names)
-    ImGui.show_tooltip('Choose which formation to edit.')
-    if new_selected_formation_index != selected_formation_index:
-        if _block_if_canvas_position_draft_dirty('switching formations'):
-            new_selected_formation_index = selected_formation_index
+    filter_active, filtered_indexes = _draw_formation_filter_controls()
+
+    if filter_active:
+        filtered_names = [_formation_combo_label(index) for index in filtered_indexes]
+        if not filtered_indexes:
+            formation = _selected_formation()
+            if formation is not None:
+                PyImGui.set_next_item_width(260)
+                PyImGui.input_text(
+                    f'Formation##formation_filter_no_matches_{formation.formation_id}',
+                    formation.name,
+                    PyImGui.InputTextFlags.ReadOnly,
+                )
+                ImGui.show_tooltip('Still selected. The active filter only hides it from the visible match list.')
+            _draw_helper_text('No formations match the filter. Clear it to choose from the full list.')
+        elif selected_formation_index in filtered_indexes:
+            filtered_selected_index = filtered_indexes.index(selected_formation_index)
+            PyImGui.set_next_item_width(260)
+            new_filtered_index = PyImGui.combo('Formation', filtered_selected_index, filtered_names)
+            ImGui.show_tooltip('Choose which visible formation to edit.')
+            if new_filtered_index != filtered_selected_index:
+                _select_formation_index(filtered_indexes[new_filtered_index])
         else:
-            _finish_canvas_drag_if_needed()
-            _cancel_formation_name_edit()
-            selected_formation_index = new_selected_formation_index
-            _set_canvas_selection_group_to_primary(formations[selected_formation_index])
+            formation = _selected_formation()
+            if formation is not None:
+                PyImGui.set_next_item_width(260)
+                PyImGui.input_text(
+                    f'Formation##formation_filter_hidden_{formation.formation_id}',
+                    formation.name,
+                    PyImGui.InputTextFlags.ReadOnly,
+                )
+                ImGui.show_tooltip('Still selected. Apply, Clear, and Save still use this formation.')
+            _draw_helper_text('Filter hides the selected formation; actions still use the selected formation.')
+            formation_filter_pick_index = max(0, min(formation_filter_pick_index, len(filtered_indexes) - 1))
+            PyImGui.set_next_item_width(220)
+            formation_filter_pick_index = PyImGui.combo(
+                'Visible Match##party_formation_filter_match',
+                formation_filter_pick_index,
+                filtered_names,
+            )
+            ImGui.show_tooltip('Pick a filtered formation, then press Select Match.')
+            PyImGui.same_line(0, 8)
+            if PyImGui.button('Select Match##party_formation_filter_select'):
+                if _select_formation_index(filtered_indexes[formation_filter_pick_index]):
+                    formation_filter_pick_index = 0
+            ImGui.show_tooltip('Switch to the visible filtered formation.')
+    else:
+        names = [_formation_combo_label(index) for index in range(len(formations))]
+        PyImGui.set_next_item_width(260)
+        new_selected_formation_index = PyImGui.combo('Formation', selected_formation_index, names)
+        ImGui.show_tooltip('Choose which formation to edit.')
+        if new_selected_formation_index != selected_formation_index:
+            _select_formation_index(new_selected_formation_index)
+
     formation = _selected_formation()
     if formation is None:
         return None
@@ -4027,7 +4786,8 @@ def _draw_formation_controls() -> PartyFormation | None:
                 'Party Slot: follows the party slot number, like Hero Slot 1. Use this when whoever is in that slot '
                 'should use the spot.\n\n'
                 'Identity: follows the same named member, account, or character identity. Use this when that member '
-                'should keep the spot even if party order changes.'
+                'should keep the spot even if party order changes.\n\n'
+                'Changing mode asks for confirmation and may require rebuilding assignments.'
             )
             ImGui.end_tooltip()
     if new_mode_index != current_mode_index:
@@ -4037,7 +4797,7 @@ def _draw_formation_controls() -> PartyFormation | None:
     _draw_target_mode_change_popup()
 
     key, modifiers, changed = ImGui.keybinding('Hotkey', formation.key(), formation.modifiers())
-    ImGui.show_tooltip('Press this shortcut to apply the formation.')
+    ImGui.show_tooltip('Press this shortcut to apply the formation. Shared hotkeys are reported in Diagnostics.')
     if changed:
         formation.set_hotkey(key, modifiers)
         _save()
@@ -4062,13 +4822,13 @@ def _draw_actions_controls(formation: PartyFormation) -> bool:
         _set_canvas_selection_group_to_primary(formations[selected_formation_index])
         _save()
         return True
-    ImGui.show_tooltip('Create a blank formation.')
+    ImGui.show_tooltip('Create a blank formation and select it for editing.')
 
     PyImGui.same_line(0, 6)
     if PyImGui.button('Duplicate'):
         _duplicate_formation(formation)
         return True
-    ImGui.show_tooltip('Copy this formation as a new one.')
+    ImGui.show_tooltip('Copy this formation as a new editable formation. Hotkeys are not copied.')
 
     PyImGui.same_line(0, 6)
     delete_label = f'Delete##delete_formation_{formation.formation_id}'
@@ -4093,7 +4853,7 @@ def _draw_actions_controls(formation: PartyFormation) -> bool:
         _save()
         _set_status(f'Deleted {removed.name}.', log=False)
         return True
-    ImGui.show_tooltip('Delete this formation.')
+    ImGui.show_tooltip('Requires confirmation. Deletes this saved formation from the config.')
 
     PyImGui.same_line(0, 6)
     if PyImGui.button('Save'):
@@ -4102,30 +4862,30 @@ def _draw_actions_controls(formation: PartyFormation) -> bool:
         else:
             _save()
             _set_status(f'Saved {formation.name}.', log=False)
-    ImGui.show_tooltip('Save your formation changes.')
+    ImGui.show_tooltip('Write formation changes to config. The previous valid config is backed up first.')
 
     _draw_action_row_label('In-Game')
     PyImGui.same_line(0, 8)
     if PyImGui.button('Apply'):
         if not _block_if_canvas_position_draft_dirty('applying formations', formation):
             _apply_formation_by_id(formation.formation_id, respect_keyboard_capture=False, use_cooldown=False)
-    ImGui.show_tooltip('Send everyone to their formation spots.')
+    ImGui.show_tooltip('Send in-game flags now for this formation. Check Apply Preview first if unsure.')
 
     PyImGui.same_line(0, 6)
     if PyImGui.button('Clear Flags'):
         _clear_formation_by_id(formation.formation_id, respect_keyboard_capture=False, use_cooldown=False)
-    ImGui.show_tooltip('Remove the active formation markers.')
+    ImGui.show_tooltip('Clear in-game flags for this formation only.')
 
     _draw_action_row_label('Files')
     PyImGui.same_line(0, 8)
     if PyImGui.button('Export Shape'):
         _export_shape_to_clipboard(formation)
-    ImGui.show_tooltip('Copy this formation layout so you can share it.')
+    ImGui.show_tooltip('Copy enabled spot labels and offsets to the clipboard. Targets and hotkeys are not included.')
 
     PyImGui.same_line(0, 6)
     if PyImGui.button('Import Shape'):
         _import_shape_from_clipboard()
-    ImGui.show_tooltip('Paste a shared formation layout.')
+    ImGui.show_tooltip('Import spot labels and offsets from the clipboard as a new unassigned formation.')
 
     _draw_action_row_label('Editor')
     PyImGui.same_line(0, 8)
@@ -4135,7 +4895,7 @@ def _draw_actions_controls(formation: PartyFormation) -> bool:
             _close_canvas_editor_from_button(formation)
         else:
             _open_canvas_editor(formation)
-    ImGui.show_tooltip('Show or hide the larger spot editor.')
+    ImGui.show_tooltip('Open the larger position editor. Movement stays draft-only until Save Positions.')
 
     return False
 
@@ -4187,6 +4947,8 @@ def _draw_formation_body_tabs(formation: PartyFormation) -> None:
 
     if PyImGui.begin_tab_item('Diagnostics##PartyFormationDiagnosticsTab'):
         _begin_major_section('Diagnostics')
+        _draw_diagnostics_tools(formation)
+        _draw_all_formations_diagnostics(formation)
         _draw_apply_preflight_snapshot(formation)
         mapping_rows = _current_party_mapping_rows(formation)
         _draw_current_party_mapping_summary(mapping_rows)
@@ -4218,9 +4980,11 @@ def _draw_formation_editor() -> None:
             selected_formation_index = len(formations) - 1
             _set_canvas_selection_group_to_primary(formations[selected_formation_index])
             _save()
+        ImGui.show_tooltip('Create the first blank formation.')
         PyImGui.same_line(0, 8)
         if PyImGui.button('Import Shape'):
             _import_shape_from_clipboard()
+        ImGui.show_tooltip('Import spot labels and offsets from the clipboard as a new unassigned formation.')
         _draw_section_header('Status')
         _draw_status()
         return

@@ -343,6 +343,80 @@ def test_config_save_load_and_legacy_load_paths() -> None:
         shutil.rmtree(temp_root, ignore_errors=True)
 
 
+def test_config_backups_create_prune_and_restore() -> None:
+    temp_root = SCRIPT_DIR / '_party_formations_backup_tmp'
+    if temp_root.exists():
+        shutil.rmtree(temp_root)
+    temp_root.mkdir(parents=True)
+
+    try:
+        config_path = temp_root / 'party_formations.json'
+        first = pf.PartyFormation(name='First', formation_id='first')
+        second = pf.PartyFormation(name='Second', formation_id='second')
+        third = pf.PartyFormation(name='Third', formation_id='third')
+
+        first_result = pf.save_formations([first], str(config_path))
+        _expect(first_result.skipped, 'first save should skip backup because no prior config exists.')
+        _expect(pf.list_config_backups(str(config_path)) == [], 'first save should not create a backup.')
+
+        second_result = pf.save_formations([second], str(config_path))
+        _expect(second_result.ok, 'second save should back up the first config before overwrite.')
+        backups = pf.list_config_backups(str(config_path))
+        _expect(len(backups) == 1, 'second save should create exactly one backup.')
+        backup_formations = pf.load_formations(backups[0].path)
+        _expect(backup_formations[0].formation_id == 'first', 'backup should contain the previous config.')
+
+        config_path.write_text('{', encoding='utf-8')
+        corrupt_result = pf.save_formations([third], str(config_path))
+        _expect(corrupt_result.skipped, 'save should not back up a malformed current config.')
+        backups_after_corrupt = pf.list_config_backups(str(config_path))
+        _expect(len(backups_after_corrupt) == 1, 'malformed current config should not add a bad backup.')
+        _expect(pf.config_load_warning(str(config_path)) == '', 'rewritten valid config should not warn.')
+
+        for index in range(8):
+            pf.save_formations(
+                [pf.PartyFormation(name=f'Version {index}', formation_id=f'version-{index}')],
+                str(config_path),
+            )
+
+        backups = pf.list_config_backups(str(config_path))
+        _expect(len(backups) == pf.CONFIG_BACKUP_LIMIT, 'backup retention should keep only the latest backups.')
+        latest_backup_formations = pf.load_formations(backups[0].path)
+        _expect(latest_backup_formations, 'latest backup should be loadable before restore.')
+
+        restore_result = pf.restore_latest_config_backup(str(config_path))
+        _expect(restore_result.ok, 'restore latest backup should succeed.')
+        restored = pf.load_formations(str(config_path))
+        _expect(
+            restored[0].formation_id == latest_backup_formations[0].formation_id,
+            'restore should replace current config with the latest backup content.',
+        )
+        _expect(
+            len(pf.list_config_backups(str(config_path))) == pf.CONFIG_BACKUP_LIMIT,
+            'restore should preserve retention limit.',
+        )
+        _expect(restore_result.preserved_current_path, 'restore should preserve current config when practical.')
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_config_load_warning_for_malformed_existing_config() -> None:
+    temp_root = SCRIPT_DIR / '_party_formations_load_warning_tmp'
+    if temp_root.exists():
+        shutil.rmtree(temp_root)
+    temp_root.mkdir(parents=True)
+
+    try:
+        missing_path = temp_root / 'missing.json'
+        corrupt_path = temp_root / 'corrupt.json'
+        corrupt_path.write_text('{', encoding='utf-8')
+
+        _expect(pf.config_load_warning(str(missing_path)) == '', 'missing config should not warn.')
+        _expect(pf.config_load_warning(str(corrupt_path)), 'corrupt config should produce a warning.')
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
 def test_config_load_normalizes_malformed_assignment_scalars() -> None:
     temp_root = SCRIPT_DIR / '_party_formations_bad_assignment_tmp'
     if temp_root.exists():
@@ -587,6 +661,8 @@ def main() -> int:
         test_shape_import_deduplicates_labels_and_defaults_blank_labels,
         test_shape_import_rejects_invalid_payloads,
         test_config_save_load_and_legacy_load_paths,
+        test_config_backups_create_prune_and_restore,
+        test_config_load_warning_for_malformed_existing_config,
         test_config_load_normalizes_malformed_assignment_scalars,
         test_config_load_treats_bad_assignment_lists_as_empty,
         test_config_load_normalizes_bad_formation_scalars,
