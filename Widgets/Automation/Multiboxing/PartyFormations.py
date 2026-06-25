@@ -34,8 +34,10 @@ from HeroAI.party_formations import export_formation_shape
 from HeroAI.party_formations import formation_has_assigned_targets
 from HeroAI.party_formations import get_available_members
 from HeroAI.party_formations import import_formation_shape
+from HeroAI.party_formations import legacy_party_formations_config_dir
 from HeroAI.party_formations import list_config_backups
 from HeroAI.party_formations import load_formations
+from HeroAI.party_formations import party_formations_config_dir
 from HeroAI.party_formations import preflight_apply_snapshot
 from HeroAI.party_formations import preflight_assignment_offset_warning
 from HeroAI.party_formations import restore_latest_config_backup
@@ -1458,11 +1460,23 @@ def _distribute_canvas_selection(formation: PartyFormation, direction: str) -> N
 
 
 def _geometry_preset_library_path() -> str:
-    try:
-        base_path = Py4GW.Console.get_projects_path()
-    except Exception:
-        base_path = os.getcwd()
-    return os.path.join(base_path, 'Widgets', 'Config', GEOMETRY_PRESET_FILENAME)
+    return os.path.join(party_formations_config_dir(), GEOMETRY_PRESET_FILENAME)
+
+
+def _legacy_geometry_preset_library_path() -> str:
+    return os.path.join(legacy_party_formations_config_dir(), GEOMETRY_PRESET_FILENAME)
+
+
+def _geometry_preset_read_path() -> str:
+    grouped_path = _geometry_preset_library_path()
+    if os.path.exists(grouped_path):
+        return grouped_path
+
+    legacy_path = _legacy_geometry_preset_library_path()
+    if os.path.exists(legacy_path):
+        return legacy_path
+
+    return grouped_path
 
 
 def _clean_geometry_preset_name(value: object) -> str:
@@ -1525,7 +1539,7 @@ def _validate_geometry_preset(raw: object, index: int) -> tuple[dict | None, str
 
 
 def _load_geometry_presets() -> tuple[list[dict], list[str]]:
-    path = _geometry_preset_library_path()
+    path = _geometry_preset_read_path()
     if not os.path.exists(path):
         return [], []
 

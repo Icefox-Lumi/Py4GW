@@ -16,6 +16,7 @@ import math
 import shutil
 import sys
 import traceback
+import types
 from pathlib import Path
 
 
@@ -37,6 +38,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from HeroAI import party_formations as pf  # noqa: E402
+
+_MISSING_MODULE = object()
 
 
 def _expect(condition: bool, message: str) -> None:
@@ -64,6 +67,27 @@ def _shape_payload(**overrides) -> str:
     }
     payload.update(overrides)
     return json.dumps(payload)
+
+
+def _install_fake_py4gw(projects_path: Path):
+    original = sys.modules.get('Py4GW', _MISSING_MODULE)
+    fake_module = types.ModuleType('Py4GW')
+
+    class _Console:
+        @staticmethod
+        def get_projects_path() -> str:
+            return str(projects_path)
+
+    fake_module.Console = _Console
+    sys.modules['Py4GW'] = fake_module
+    return original
+
+
+def _restore_py4gw(original) -> None:
+    if original is _MISSING_MODULE:
+        sys.modules.pop('Py4GW', None)
+    else:
+        sys.modules['Py4GW'] = original
 
 
 def test_rotation_round_trip() -> None:
@@ -343,6 +367,42 @@ def test_config_save_load_and_legacy_load_paths() -> None:
         shutil.rmtree(temp_root, ignore_errors=True)
 
 
+def test_default_config_path_uses_grouped_storage_and_legacy_load_fallback() -> None:
+    temp_root = SCRIPT_DIR / '_party_formations_default_path_tmp'
+    if temp_root.exists():
+        shutil.rmtree(temp_root)
+    temp_root.mkdir(parents=True)
+
+    original_py4gw = _install_fake_py4gw(temp_root)
+    try:
+        grouped_path = temp_root / 'Widgets' / 'Config' / 'PartyFormations' / 'party_formations.json'
+        legacy_path = temp_root / 'Widgets' / 'Config' / 'party_formations.json'
+
+        _expect(Path(pf.default_config_path()) == grouped_path, 'default config path should use grouped storage.')
+        _expect(Path(pf.legacy_config_path()) == legacy_path, 'legacy config path should keep the old location.')
+
+        old_formation = pf.PartyFormation(name='Old', formation_id='old-path')
+        pf.save_formations([old_formation], str(legacy_path))
+        loaded_old = pf.load_formations()
+        _expect(len(loaded_old) == 1, 'default load should find old-path config when grouped config is missing.')
+        _expect(loaded_old[0].formation_id == 'old-path', 'old-path formation should load by default.')
+
+        new_formation = pf.PartyFormation(name='New', formation_id='new-path')
+        pf.save_formations([new_formation])
+        _expect(grouped_path.is_file(), 'default save should write the grouped config file.')
+        _expect(legacy_path.is_file(), 'default save should not delete the old config file.')
+
+        loaded_new = pf.load_formations()
+        _expect(len(loaded_new) == 1, 'default load should use grouped config once it exists.')
+        _expect(loaded_new[0].formation_id == 'new-path', 'grouped config should take precedence.')
+
+        legacy_loaded = pf.load_formations(str(legacy_path))
+        _expect(legacy_loaded[0].formation_id == 'old-path', 'old config content should be left untouched.')
+    finally:
+        _restore_py4gw(original_py4gw)
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
 def test_config_backups_create_prune_and_restore() -> None:
     temp_root = SCRIPT_DIR / '_party_formations_backup_tmp'
     if temp_root.exists():
@@ -397,6 +457,44 @@ def test_config_backups_create_prune_and_restore() -> None:
         )
         _expect(restore_result.preserved_current_path, 'restore should preserve current config when practical.')
     finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_default_restore_can_use_legacy_backups_without_overwriting_legacy_config() -> None:
+    temp_root = SCRIPT_DIR / '_party_formations_legacy_backup_tmp'
+    if temp_root.exists():
+        shutil.rmtree(temp_root)
+    temp_root.mkdir(parents=True)
+
+    original_py4gw = _install_fake_py4gw(temp_root)
+    try:
+        grouped_path = Path(pf.default_config_path())
+        legacy_path = Path(pf.legacy_config_path())
+
+        pf.save_formations([pf.PartyFormation(name='First', formation_id='legacy-first')], str(legacy_path))
+        pf.save_formations([pf.PartyFormation(name='Second', formation_id='legacy-current')], str(legacy_path))
+
+        backups = pf.list_config_backups()
+        _expect(len(backups) == 1, 'default backup listing should find legacy backups when grouped backups are absent.')
+        _expect(
+            Path(backups[0].path).parent == Path(pf.config_backup_dir(str(legacy_path))),
+            'legacy backup should come from the old backup folder.',
+        )
+
+        restore_result = pf.restore_latest_config_backup()
+        _expect(restore_result.ok, 'default restore should be able to restore a legacy backup.')
+        _expect(grouped_path.is_file(), 'default restore should write restored data to grouped config.')
+
+        restored = pf.load_formations()
+        _expect(restored[0].formation_id == 'legacy-first', 'restored legacy backup should load from grouped config.')
+
+        legacy_current = pf.load_formations(str(legacy_path))
+        _expect(
+            legacy_current[0].formation_id == 'legacy-current',
+            'restoring a legacy backup should not overwrite the old config file.',
+        )
+    finally:
+        _restore_py4gw(original_py4gw)
         shutil.rmtree(temp_root, ignore_errors=True)
 
 
@@ -661,7 +759,9 @@ def main() -> int:
         test_shape_import_deduplicates_labels_and_defaults_blank_labels,
         test_shape_import_rejects_invalid_payloads,
         test_config_save_load_and_legacy_load_paths,
+        test_default_config_path_uses_grouped_storage_and_legacy_load_fallback,
         test_config_backups_create_prune_and_restore,
+        test_default_restore_can_use_legacy_backups_without_overwriting_legacy_config,
         test_config_load_warning_for_malformed_existing_config,
         test_config_load_normalizes_malformed_assignment_scalars,
         test_config_load_treats_bad_assignment_lists_as_empty,

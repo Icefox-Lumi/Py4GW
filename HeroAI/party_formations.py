@@ -16,6 +16,8 @@ UNMAPPED_KEY_NAME = 'Unmapped'
 NO_MODIFIER_VALUE = 0
 CONFIG_BACKUP_LIMIT = 5
 CONFIG_BACKUP_DIR_SUFFIX = '_backups'
+CONFIG_DIR_NAME = 'PartyFormations'
+CONFIG_FILENAME = 'party_formations.json'
 SHAPE_EXPORT_TYPE = 'py4gw_party_formation_shape'
 SHAPE_EXPORT_VERSION = 1
 SHAPE_COORDINATE_SPACE = 'leader_relative_facing'
@@ -413,14 +415,41 @@ def inverse_rotate_offset(delta_x: float, delta_y: float, facing_angle: float) -
     )
 
 
-def default_config_path() -> str:
+def _projects_path() -> str:
     try:
         import Py4GW
 
-        base_path = Py4GW.Console.get_projects_path()
+        return Py4GW.Console.get_projects_path()
     except Exception:
-        base_path = os.getcwd()
-    return os.path.join(base_path, 'Widgets', 'Config', 'party_formations.json')
+        return os.getcwd()
+
+
+def party_formations_config_dir() -> str:
+    return os.path.join(_projects_path(), 'Widgets', 'Config', CONFIG_DIR_NAME)
+
+
+def legacy_party_formations_config_dir() -> str:
+    return os.path.join(_projects_path(), 'Widgets', 'Config')
+
+
+def default_config_path() -> str:
+    return os.path.join(party_formations_config_dir(), CONFIG_FILENAME)
+
+
+def legacy_config_path() -> str:
+    return os.path.join(legacy_party_formations_config_dir(), CONFIG_FILENAME)
+
+
+def _default_read_config_path() -> str:
+    grouped_path = default_config_path()
+    if os.path.exists(grouped_path):
+        return grouped_path
+
+    legacy_path = legacy_config_path()
+    if os.path.exists(legacy_path):
+        return legacy_path
+
+    return grouped_path
 
 
 def config_backup_dir(path: str | None = None) -> str:
@@ -440,12 +469,39 @@ def _config_backup_filename(path: str) -> str:
     return f'{_config_backup_stem(path)}.{timestamp}.{time.time_ns()}.json'
 
 
+def _config_backup_dir_has_entries(path: str) -> bool:
+    backup_dir = config_backup_dir(path)
+    if not os.path.isdir(backup_dir):
+        return False
+
+    stem = _config_backup_stem(path)
+    prefix = f'{stem}.'
+    try:
+        names = os.listdir(backup_dir)
+    except OSError:
+        return False
+
+    return any(name.startswith(prefix) and name.endswith('.json') for name in names)
+
+
+def _default_backup_lookup_path() -> str:
+    grouped_path = default_config_path()
+    if _config_backup_dir_has_entries(grouped_path):
+        return grouped_path
+
+    legacy_path = legacy_config_path()
+    if _config_backup_dir_has_entries(legacy_path):
+        return legacy_path
+
+    return _default_read_config_path()
+
+
 def _config_backup_sort_key(info: FormationConfigBackupInfo) -> tuple[float, str]:
     return float(info.created_at or 0.0), info.name
 
 
 def list_config_backups(path: str | None = None) -> list[FormationConfigBackupInfo]:
-    resolved_path = path or default_config_path()
+    resolved_path = path or _default_backup_lookup_path()
     backup_dir = config_backup_dir(resolved_path)
     if not os.path.isdir(backup_dir):
         return []
@@ -517,7 +573,7 @@ def _read_valid_config_text(path: str) -> tuple[str | None, str]:
 
 
 def config_load_warning(path: str | None = None) -> str:
-    resolved_path = path or default_config_path()
+    resolved_path = path or _default_read_config_path()
     _text, error = _read_valid_config_text(resolved_path)
     if error == 'No existing config file to back up.':
         return ''
@@ -566,7 +622,7 @@ def create_config_backup(
     *,
     limit: int = CONFIG_BACKUP_LIMIT,
 ) -> FormationConfigBackupResult:
-    resolved_path = path or default_config_path()
+    resolved_path = path or _default_read_config_path()
     text, error = _read_valid_config_text(resolved_path)
     if text is None:
         return FormationConfigBackupResult(
@@ -599,8 +655,9 @@ def restore_latest_config_backup(
     *,
     limit: int = CONFIG_BACKUP_LIMIT,
 ) -> FormationConfigBackupResult:
+    backup_lookup_path = path or _default_backup_lookup_path()
     resolved_path = path or default_config_path()
-    backups = list_config_backups(resolved_path)
+    backups = list_config_backups(backup_lookup_path)
     if not backups:
         return FormationConfigBackupResult(message='No Party Formations config backups are available.')
 
@@ -651,7 +708,7 @@ def restore_latest_config_backup(
 
 
 def load_formations(path: str | None = None) -> list[PartyFormation]:
-    resolved_path = path or default_config_path()
+    resolved_path = path or _default_read_config_path()
     if not os.path.exists(resolved_path):
         return []
 
