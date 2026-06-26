@@ -19,6 +19,8 @@ from Py4GWCoreLib.modular.paths import project_root as _shared_project_root
 HERO_SLOT_COUNT = 7
 CONFIG_VERSION = 1
 SETTINGS_DIR_NAME = 'HeroTeamManager'
+CONFIG_ROOT_DIR = 'Widgets'
+CONFIG_SUBDIR = 'Config'
 MERCENARY_HERO_IDS = set(range(28, 36))
 HERO_IDS = [hero_id for hero_id, _name in HERO_OPTIONS]
 HERO_ID_TO_INDEX = {hero_id: idx for idx, hero_id in enumerate(HERO_IDS)}
@@ -240,13 +242,36 @@ def resolved_account_key(account_key: str | None = None) -> str:
     return _safe_filename(account_key if account_key is not None else safe_account_key())
 
 
+def config_root() -> str:
+    return os.path.join(_project_root(), CONFIG_ROOT_DIR, CONFIG_SUBDIR, SETTINGS_DIR_NAME)
+
+
 def settings_root() -> str:
+    return config_root()
+
+
+def legacy_settings_root() -> str:
     return os.path.join(_project_root(), 'Settings', SETTINGS_DIR_NAME)
 
 
 def account_config_path(account_key: str | None = None) -> str:
     key = resolved_account_key(account_key)
     return os.path.join(settings_root(), 'accounts', f'{key}.json')
+
+
+def legacy_account_config_path(account_key: str | None = None) -> str:
+    key = resolved_account_key(account_key)
+    return os.path.join(legacy_settings_root(), 'accounts', f'{key}.json')
+
+
+def hero_team_manager_ui_ini_path(account_key: str | None, filename: str) -> str:
+    key = resolved_account_key(account_key)
+    return os.path.join(config_root(), 'ui', key, str(filename or '').strip())
+
+
+def legacy_hero_team_manager_ui_ini_path(account_key: str | None, filename: str) -> str:
+    key = resolved_account_key(account_key)
+    return os.path.join(_project_root(), 'Settings', key, 'Widgets', 'Hero Team Manager', str(filename or '').strip())
 
 
 def _new_id(prefix: str, name: str = '') -> str:
@@ -555,6 +580,8 @@ def normalize_config(raw: dict[str, Any] | HeroTeamConfig | None) -> HeroTeamCon
 def load_config(account_key: str | None = None) -> HeroTeamConfig:
     key = resolved_account_key(account_key)
     path = account_config_path(key)
+    if not os.path.isfile(path):
+        path = legacy_account_config_path(key)
     if not os.path.isfile(path):
         return default_config(account_key=key)
     try:

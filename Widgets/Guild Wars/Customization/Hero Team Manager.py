@@ -7,6 +7,7 @@ import Py4GW
 import PyImGui
 
 from Py4GWCoreLib.ImGui import ImGui
+from Py4GWCoreLib.IniManager import ConfigNode
 from Py4GWCoreLib.IniManager import IniManager
 from Py4GWCoreLib.hero_team_manager import HERO_BEHAVIOR_LABELS
 from Py4GWCoreLib.hero_team_manager import HERO_BEHAVIOR_DONT_CHANGE
@@ -37,7 +38,9 @@ from Py4GWCoreLib.hero_team_manager import hero_alias
 from Py4GWCoreLib.hero_team_manager import hero_default_name
 from Py4GWCoreLib.hero_team_manager import hero_display_name
 from Py4GWCoreLib.hero_team_manager import hero_labels
+from Py4GWCoreLib.hero_team_manager import hero_team_manager_ui_ini_path
 from Py4GWCoreLib.hero_team_manager import is_pristine_default_config
+from Py4GWCoreLib.hero_team_manager import legacy_hero_team_manager_ui_ini_path
 from Py4GWCoreLib.hero_team_manager import load_config
 from Py4GWCoreLib.hero_team_manager import resolve_slot_template_code
 from Py4GWCoreLib.hero_team_manager import safe_account_key
@@ -45,6 +48,8 @@ from Py4GWCoreLib.hero_team_manager import save_config
 from Py4GWCoreLib.hero_team_manager import save_current_party_as_team
 from Py4GWCoreLib.hero_team_manager import set_hero_alias
 from Py4GWCoreLib.hero_team_manager import summarize_skill_template
+from Py4GWCoreLib.py4gwcorelib_src.IniHandler import IniHandler
+from Py4GWCoreLib.py4gwcorelib_src.Timer import ThrottledTimer
 
 
 MODULE_NAME = 'Hero Team Manager'
@@ -109,9 +114,11 @@ TEMPLATE_BROWSER_MIN_SPLIT_WIDTH = (
     TEMPLATE_BROWSER_LIST_WIDTH + TEMPLATE_DETAILS_MIN_SPLIT_WIDTH + TEMPLATE_BROWSER_COLUMN_GAP
 )
 CONFIRM_POPUP_ID = 'Confirm Hero Team Manager Action##hero_team_manager_confirm'
-WINDOW_INI_PATH = 'Widgets/Hero Team Manager'
-WINDOW_INI_FILE = 'Hero Team Manager.MainWindow.ini'
-FLOATING_UI_INI_FILE = 'Hero Team Manager.FloatingIcon.ini'
+UI_INI_KEY_PATH = 'HeroTeamManager/ui'
+WINDOW_INI_FILE = 'MainWindow.ini'
+FLOATING_UI_INI_FILE = 'FloatingIcon.ini'
+LEGACY_WINDOW_INI_FILE = 'Hero Team Manager.MainWindow.ini'
+LEGACY_FLOATING_UI_INI_FILE = 'Hero Team Manager.FloatingIcon.ini'
 FLOATING_ICON_WINDOW_ID = '##hero_team_manager_floating_icon_button'
 FLOATING_ICON_WINDOW_NAME = 'Hero Team Manager Toggle'
 TEMPLATE_GROUP_ORDER_SECTION = 'Templates'
@@ -1471,18 +1478,90 @@ def _init_window_persistence_once() -> bool:
     if _window_ini_ready:
         return bool(_window_ini_key and _floating_ui_ini_key)
 
-    _window_ini_key = IniManager().ensure_key(WINDOW_INI_PATH, WINDOW_INI_FILE)
+    account_key = safe_account_key()
+    if account_key == 'default':
+        return False
+
+    _window_ini_key = _ensure_ui_ini_key(account_key, WINDOW_INI_FILE, LEGACY_WINDOW_INI_FILE)
     if not _window_ini_key:
         return False
 
     IniManager().load_once(_window_ini_key)
 
-    _floating_ui_ini_key = IniManager().ensure_key(WINDOW_INI_PATH, FLOATING_UI_INI_FILE)
+    _floating_ui_ini_key = _ensure_ui_ini_key(account_key, FLOATING_UI_INI_FILE, LEGACY_FLOATING_UI_INI_FILE)
     if not _floating_ui_ini_key:
         return False
 
     _window_ini_ready = True
     return True
+
+
+def _ensure_ui_ini_key(account_key: str, filename: str, legacy_filename: str) -> str:
+    key = f'{UI_INI_KEY_PATH}/{account_key}/{filename}'
+    return _ensure_file_ini_key(
+        key,
+        hero_team_manager_ui_ini_path(account_key, filename),
+        legacy_hero_team_manager_ui_ini_path(account_key, legacy_filename),
+    )
+
+
+def _ensure_file_ini_key(key: str, filename: str, fallback_filename: str) -> str:
+    key = str(key or '').strip('/')
+    filename = os.path.normpath(str(filename or ''))
+    fallback_filename = os.path.normpath(str(fallback_filename or '')) if fallback_filename else ''
+    if not key or not filename:
+        return ''
+
+    manager = IniManager()
+    handlers = getattr(manager, '_handlers', None)
+    if not isinstance(handlers, dict):
+        return ''
+    if key in handlers:
+        return key
+
+    try:
+        if not os.path.exists(filename):
+            directory = os.path.dirname(filename)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(filename, 'w', encoding='utf-8') as handle:
+                handle.write(_ui_ini_seed_content(fallback_filename))
+
+        ini = IniHandler(filename)
+        section = 'Window config'
+        node = ConfigNode(
+            key=key,
+            path=os.path.dirname(filename),
+            filename=os.path.basename(filename),
+            ini_handler=ini,
+            initialized=False,
+            update_time=ThrottledTimer(500),
+            needs_update=False,
+            x_pos=ini.read_int(section, 'x', 0),
+            y_pos=ini.read_int(section, 'y', 0),
+            width=ini.read_int(section, 'width', 0),
+            height=ini.read_int(section, 'height', 0),
+            collapsed=ini.read_bool(section, 'collapsed', False),
+        )
+        node.is_global = True
+        node.update_time.Start()
+        handlers[key] = node
+        return key
+    except Exception as exc:
+        _log_error(exc)
+        return ''
+
+
+def _ui_ini_seed_content(fallback_filename: str) -> str:
+    for source_path in (fallback_filename, os.path.join(IniManager().get_defaults_path(), 'default_template.cfg')):
+        if not source_path or not os.path.exists(source_path):
+            continue
+        try:
+            with open(source_path, 'r', encoding='utf-8') as handle:
+                return handle.read()
+        except Exception:
+            continue
+    return ''
 
 
 def _get_floating_icon_path() -> str:
